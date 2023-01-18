@@ -33,6 +33,8 @@ For more information, see package [`github.com/shurcooL/githubv4`](https://githu
 			- [Stop the subscription](#stop-the-subscription)
 			- [Authentication](#authentication-1)
 			- [Options](#options)
+			- [Subscription Protocols](#subscription-protocols)
+			- [Handle connection error](#handle-connection-error)
 			- [Events](#events)
 			- [Custom HTTP Client](#custom-http-client)
 			- [Custom WebSocket client](#custom-websocket-client)
@@ -558,9 +560,17 @@ client := graphql.NewSubscriptionClient("wss://example.com/graphql").
 		"headers": map[string]string{
 				"authentication": "...",
 		},
+	}).
+	// or lazy parameters with function 
+  WithConnectionParamsFn(func () map[string]interface{} {
+		return map[string]interface{} {
+			"headers": map[string]string{
+  				"authentication": "...",
+  		},
+		}
 	})
-
 ```
+
 
 #### Options
 
@@ -575,8 +585,35 @@ client.
 	// max size of response message
 	WithReadLimit(10*1024*1024).
 	// these operation event logs won't be printed
-	WithoutLogTypes(graphql.GQL_DATA, graphql.GQL_CONNECTION_KEEP_ALIVE)
+	WithoutLogTypes(graphql.GQLData, graphql.GQLConnectionKeepAlive)
+```
 
+#### Subscription Protocols
+
+The subscription client supports 2 protocols:
+- [subscriptions-transport-ws](https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md) (default)
+- [graphql-ws](https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md)
+
+The protocol can be switchable by the `WithProtocol` function.
+
+```Go
+client.WithProtocol(graphql.GraphQLWS)
+```
+
+#### Handle connection error
+
+GraphQL servers can define custom WebSocket error codes in the 3000-4999 range. For example, in the `graphql-ws` protocol, the server sends the invalid message error with status [4400](https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md#invalid-message). In this case, the subscription client should let the user handle the error through the `OnError` event.
+
+```go
+client := graphql.NewSubscriptionClient(serverEndpoint).
+  OnError(func(sc *graphql.SubscriptionClient, err error) error {
+  	if strings.Contains(err.Error(), "invalid x-hasura-admin-secret/x-hasura-access-key") {
+			// exit the subscription client due to unauthorized error
+  		return err
+  	}
+		// otherwise ignore the error and the client continues to run
+  	return nil
+  })
 ```
 
 #### Events
