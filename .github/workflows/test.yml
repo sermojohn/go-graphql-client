@@ -61,3 +61,6 @@ jobs:
         with:
           recreate: true
           path: code-coverage-results.md
+      - name: Dump docker logs on failure
+        if: failure()
+        uses: jwalton/gh-docker-logs@v2

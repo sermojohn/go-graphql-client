@@ -29,7 +29,7 @@ func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 
 type user_insert_input map[string]interface{}
 
-func graphqlWS_setupClients() (*Client, *SubscriptionClient) {
+func hasura_setupClients(protocol SubscriptionProtocolType) (*Client, *SubscriptionClient) {
 	endpoint := fmt.Sprintf("%s/v1/graphql", hasuraTestHost)
 	client := NewClient(endpoint, &http.Client{Transport: headerRoundTripper{
 		setHeaders: func(req *http.Request) {
@@ -39,7 +39,7 @@ func graphqlWS_setupClients() (*Client, *SubscriptionClient) {
 	}})
 
 	subscriptionClient := NewSubscriptionClient(endpoint).
-		WithProtocol(GraphQLWS).
+		WithProtocol(protocol).
 		WithConnectionParams(map[string]interface{}{
 			"headers": map[string]string{
 				"x-hasura-admin-secret": hasuraTestAdminSecret,
@@ -81,7 +81,7 @@ func waitHasuraService(timeoutSecs int) error {
 
 func TestGraphqlWS_Subscription(t *testing.T) {
 	stop := make(chan bool)
-	client, subscriptionClient := graphqlWS_setupClients()
+	client, subscriptionClient := hasura_setupClients(GraphQLWS)
 	msg := randomID()
 
 	subscriptionClient = subscriptionClient.
@@ -173,4 +173,106 @@ func TestGraphqlWS_Subscription(t *testing.T) {
 	}
 
 	<-stop
+}
+
+func TestGraphqlWS_SubscriptionRerun(t *testing.T) {
+	client, subscriptionClient := hasura_setupClients(GraphQLWS)
+	msg := randomID()
+
+	subscriptionClient = subscriptionClient.
+		OnError(func(sc *SubscriptionClient, err error) error {
+			return err
+		})
+
+	/*
+		subscription {
+			user {
+				id
+				name
+			}
+		}
+	*/
+	var sub struct {
+		Users []struct {
+			ID   int    `graphql:"id"`
+			Name string `graphql:"name"`
+		} `graphql:"user(order_by: { id: desc }, limit: 5)"`
+	}
+
+	subId1, err := subscriptionClient.Subscribe(sub, nil, func(data []byte, e error) error {
+		if e != nil {
+			t.Fatalf("got error: %v, want: nil", e)
+			return nil
+		}
+
+		log.Println("result", string(data))
+		e = json.Unmarshal(data, &sub)
+		if e != nil {
+			t.Fatalf("got error: %v, want: nil", e)
+			return nil
+		}
+
+		if len(sub.Users) > 0 && sub.Users[0].Name != msg {
+			t.Fatalf("subscription message does not match. got: %s, want: %s", sub.Users[0].Name, msg)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("got error: %v, want: nil", err)
+	}
+
+	go func() {
+		if err := subscriptionClient.Run(); err != nil {
+			(*t).Fatalf("got error: %v, want: nil", err)
+		}
+	}()
+
+	defer subscriptionClient.Close()
+
+	// wait until the subscription client connects to the server
+	if err := waitHasuraService(60); err != nil {
+		t.Fatalf("failed to start hasura service: %s", err)
+	}
+
+	// call a mutation request to send message to the subscription
+	/*
+		mutation InsertUser($objects: [user_insert_input!]!) {
+			insert_user(objects: $objects) {
+				id
+				name
+			}
+		}
+	*/
+	var q struct {
+		InsertUser struct {
+			Returning []struct {
+				ID   int    `graphql:"id"`
+				Name string `graphql:"name"`
+			} `graphql:"returning"`
+		} `graphql:"insert_user(objects: $objects)"`
+	}
+	variables := map[string]interface{}{
+		"objects": []user_insert_input{
+			{
+				"name": msg,
+			},
+		},
+	}
+	err = client.Mutate(context.Background(), &q, variables, OperationName("InsertUser"))
+
+	if err != nil {
+		t.Fatalf("got error: %v, want: nil", err)
+	}
+
+	time.Sleep(2 * time.Second)
+	go func() {
+		time.Sleep(2 * time.Second)
+		subscriptionClient.Unsubscribe(subId1)
+	}()
+
+	if err := subscriptionClient.Run(); err != nil {
+		(*t).Fatalf("got error: %v, want: nil", err)
+	}
 }

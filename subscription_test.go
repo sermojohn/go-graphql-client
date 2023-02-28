@@ -114,7 +114,9 @@ func (r *resolver) broadcastHelloSaid() {
 		case id := <-unsubscribe:
 			delete(subscribers, id)
 		case s := <-r.helloSaidSubscriber:
-			subscribers[randomID()] = s
+			id := randomID()
+			log.Println("new client subscribed: ", id)
+			subscribers[id] = s
 		case e := <-r.helloSaidEvents:
 			for id, s := range subscribers {
 				go func(id string, s *helloSaidSubscriber) {
@@ -400,4 +402,160 @@ func TestSubscriptionLifeCycle2(t *testing.T) {
 	if err := subscriptionClient.Run(); err != nil {
 		t.Fatalf("got error: %v, want: nil", err)
 	}
+}
+
+func TestSubscription_ResetClient(t *testing.T) {
+
+	stop := make(chan bool)
+	client, subscriptionClient := hasura_setupClients(SubscriptionsTransportWS)
+	msg := randomID()
+
+	subscriptionClient.
+		OnError(func(sc *SubscriptionClient, err error) error {
+			t.Fatalf("got error: %v, want: nil", err)
+			return err
+		}).
+		OnDisconnected(func() {
+			log.Println("disconnected")
+		})
+
+	/*
+		subscription {
+			user {
+				id
+				name
+			}
+		}
+	*/
+	var sub struct {
+		Users []struct {
+			ID   int    `graphql:"id"`
+			Name string `graphql:"name"`
+		} `graphql:"user(order_by: { id: desc }, limit: 5)"`
+	}
+
+	subId1, err := subscriptionClient.Subscribe(sub, nil, func(data []byte, e error) error {
+		if e != nil {
+			t.Fatalf("got error: %v, want: nil", e)
+			return nil
+		}
+
+		log.Println("result", string(data))
+		e = json.Unmarshal(data, &sub)
+		if e != nil {
+			t.Fatalf("got error: %v, want: nil", e)
+			return nil
+		}
+
+		if len(sub.Users) > 0 && sub.Users[0].Name != msg {
+			t.Fatalf("subscription message does not match. got: %s, want: %s", sub.Users[0].Name, msg)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("got error: %v, want: nil", err)
+	}
+
+	defer subscriptionClient.Close()
+
+	// wait until the subscription client connects to the server
+	if err := waitHasuraService(60); err != nil {
+		t.Fatalf("failed to start hasura service: %s", err)
+	}
+
+	/*
+		subscription {
+			user {
+				id
+				name
+			}
+		}
+	*/
+	var sub2 struct {
+		Users []struct {
+			ID int `graphql:"id"`
+		} `graphql:"user(order_by: { id: desc }, limit: 5)"`
+	}
+
+	subId2, err := subscriptionClient.Subscribe(sub2, nil, func(data []byte, e error) error {
+		if e != nil {
+			t.Fatalf("got error: %v, want: nil", e)
+			return nil
+		}
+
+		log.Println("result", string(data))
+		e = json.Unmarshal(data, &sub2)
+		if e != nil {
+			t.Fatalf("got error: %v, want: nil", e)
+			return nil
+		}
+
+		if len(sub.Users) > 0 && sub.Users[0].Name != msg {
+			t.Fatalf("subscription message does not match. got: %s, want: %s", sub.Users[0].Name, msg)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("got error: %v, want: nil", err)
+	}
+
+	go func() {
+
+		// call a mutation request to send message to the subscription
+		/*
+			mutation InsertUser($objects: [user_insert_input!]!) {
+				insert_user(objects: $objects) {
+					id
+					name
+				}
+			}
+		*/
+		var q struct {
+			InsertUser struct {
+				Returning []struct {
+					ID   int    `graphql:"id"`
+					Name string `graphql:"name"`
+				} `graphql:"returning"`
+			} `graphql:"insert_user(objects: $objects)"`
+		}
+		variables := map[string]interface{}{
+			"objects": []user_insert_input{
+				{
+					"name": msg,
+				},
+			},
+		}
+		err = client.Mutate(context.Background(), &q, variables, OperationName("InsertUser"))
+
+		if err != nil {
+			(*t).Fatalf("got error: %v, want: nil", err)
+		}
+
+		time.Sleep(2 * time.Second)
+		// reset the subscription
+		log.Printf("resetting the subscription client...")
+		if err := subscriptionClient.Run(); err != nil {
+			(*t).Fatalf("failed to reset the subscription client. got error: %v, want: nil", err)
+		}
+		log.Printf("the second run was stopped")
+		stop <- true
+	}()
+
+	go func() {
+		time.Sleep(8 * time.Second)
+		subscriptionClient.Unsubscribe(subId1)
+		subscriptionClient.Unsubscribe(subId2)
+	}()
+
+	defer subscriptionClient.Close()
+
+	if err := subscriptionClient.Run(); err != nil {
+		t.Fatalf("got error: %v, want: nil", err)
+	}
+
+	<-stop
 }
