@@ -132,6 +132,9 @@ func (gws *graphqlWS) OnMessage(ctx *SubscriptionContext, subscription Subscript
 		_ = gws.Unsubscribe(ctx, message.ID)
 	case GQLPing:
 		ctx.Log(message, "server", GQLPing)
+		if ctx.onConnectionAlive != nil {
+			ctx.onConnectionAlive()
+		}
 		// send pong response message back to the server
 		msg := OperationMessage{
 			Type:    GQLPong,

@@ -164,6 +164,9 @@ func (stw *subscriptionsTransportWS) OnMessage(ctx *SubscriptionContext, subscri
 		_ = stw.Unsubscribe(ctx, message.ID)
 	case GQLConnectionKeepAlive:
 		ctx.Log(message, "server", GQLConnectionKeepAlive)
+		if ctx.onConnectionAlive != nil {
+			ctx.onConnectionAlive()
+		}
 	case GQLConnectionAck:
 		// Expected response to the ConnectionInit message from the client acknowledging a successful connection with the server.
 		// The client is now ready to request subscription operations.

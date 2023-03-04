@@ -107,16 +107,17 @@ type SubscriptionProtocol interface {
 // SubscriptionContext represents a shared context for protocol implementations with the websocket connection inside
 type SubscriptionContext struct {
 	context.Context
-	websocketConn    WebsocketConn
-	OnConnected      func()
-	onDisconnected   func()
-	cancel           context.CancelFunc
-	subscriptions    map[string]Subscription
-	disabledLogTypes []OperationMessageType
-	log              func(args ...interface{})
-	acknowledged     int32
-	exitStatusCodes  []int
-	mutex            sync.Mutex
+	websocketConn     WebsocketConn
+	OnConnected       func()
+	onDisconnected    func()
+	onConnectionAlive func()
+	cancel            context.CancelFunc
+	subscriptions     map[string]Subscription
+	disabledLogTypes  []OperationMessageType
+	log               func(args ...interface{})
+	acknowledged      int32
+	exitStatusCodes   []int
+	mutex             sync.Mutex
 }
 
 // Log prints condition logging with message type filters
@@ -416,6 +417,12 @@ func (sc *SubscriptionClient) OnConnected(fn func()) *SubscriptionClient {
 // OnDisconnected event is triggered when the websocket client was disconnected
 func (sc *SubscriptionClient) OnDisconnected(fn func()) *SubscriptionClient {
 	sc.context.onDisconnected = fn
+	return sc
+}
+
+// OnConnectionAlive event is triggered when the websocket receive a connection alive message (differs per protocol)
+func (sc *SubscriptionClient) OnConnectionAlive(fn func()) *SubscriptionClient {
+	sc.context.onConnectionAlive = fn
 	return sc
 }
 
