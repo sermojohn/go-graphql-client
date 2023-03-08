@@ -138,6 +138,9 @@ func (stw *subscriptionsTransportWS) OnMessage(ctx *SubscriptionContext, subscri
 			Data   *json.RawMessage
 			Errors Errors
 		}
+		if subscription.handler == nil {
+			return
+		}
 
 		err := json.Unmarshal(message.Payload, &out)
 		if err != nil {

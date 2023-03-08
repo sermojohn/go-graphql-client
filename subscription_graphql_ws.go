@@ -110,6 +110,9 @@ func (gws *graphqlWS) OnMessage(ctx *SubscriptionContext, subscription Subscript
 			Data   *json.RawMessage
 			Errors Errors
 		}
+		if subscription.handler == nil {
+			return
+		}
 
 		err := json.Unmarshal(message.Payload, &out)
 		if err != nil {

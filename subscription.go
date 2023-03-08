@@ -181,7 +181,10 @@ func (sc *SubscriptionContext) GetSubscription(id string) *Subscription {
 	if sc.subscriptions == nil {
 		return nil
 	}
-	sub, _ := sc.subscriptions[id]
+	sub, found := sc.subscriptions[id]
+	if !found {
+		return nil
+	}
 	return &sub
 }
 
@@ -617,6 +620,9 @@ func (sc *SubscriptionClient) Run() error {
 				}
 
 				sub := sc.context.GetSubscription(message.ID)
+				if sub == nil {
+					sub = &Subscription{}
+				}
 				go sc.protocol.OnMessage(sc.context, *sub, message)
 			}
 		}
