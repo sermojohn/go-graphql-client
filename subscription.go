@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +19,10 @@ import (
 )
 
 // SubscriptionProtocolType represents the protocol specification enum of the subscription
-type SubscriptionProtocolType String
+type SubscriptionProtocolType string
+
+// internal subscription status
+type SubscriptionStatus int32
 
 const (
 	// internal state machine status
@@ -26,8 +30,20 @@ const (
 	scStatusRunning      int32 = 1
 	scStatusClosing      int32 = 2
 
+	// SubscriptionWaiting the subscription hasn't been registered to the server
+	SubscriptionWaiting SubscriptionStatus = 0
+	// SubscriptionRunning the subscription is up and running
+	SubscriptionRunning SubscriptionStatus = 1
+	// SubscriptionUnsubcribed the subscription was manually unsubscribed by the user
+	SubscriptionUnsubcribed SubscriptionStatus = 2
+
+	// SubscriptionsTransportWS the enum implements the subscription transport that follows Apollo's subscriptions-transport-ws protocol specification
+	// https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md
 	SubscriptionsTransportWS SubscriptionProtocolType = "subscriptions-transport-ws"
-	GraphQLWS                SubscriptionProtocolType = "graphql-ws"
+
+	// GraphQLWS enum implements GraphQL over WebSocket Protocol (graphql-ws)
+	// https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md
+	GraphQLWS SubscriptionProtocolType = "graphql-ws"
 
 	// Receiving a message of a type or format which is not specified in this document
 	// The <error-message> can be vaguely descriptive on why the received message is invalid.
@@ -57,8 +73,12 @@ const (
 	GQL_INTERNAL = GQLInternal
 )
 
-// ErrSubscriptionStopped a special error which forces the subscription stop
-var ErrSubscriptionStopped = errors.New("subscription stopped")
+var (
+	// ErrSubscriptionStopped a special error which forces the subscription stop
+	ErrSubscriptionStopped = errors.New("subscription stopped")
+
+	errRetry = errors.New("retry subscription client")
+)
 
 // OperationMessage represents a subscription operation message
 type OperationMessage struct {
@@ -85,6 +105,10 @@ type WebsocketConn interface {
 	// message exceeds the limit, the connection sends a close message to the peer
 	// and returns ErrReadLimit to the application.
 	SetReadLimit(limit int64)
+	// GetCloseStatus tries to get WebSocket close status from error
+	// return -1 if the error is unknown
+	// https://www.iana.org/assignments/websocket/websocket.xhtml
+	GetCloseStatus(error) int32
 }
 
 // SubscriptionProtocol abstracts the life-cycle of subscription protocol implementation for a specific transport protocol
@@ -95,11 +119,11 @@ type SubscriptionProtocol interface {
 	// ConnectionInit sends a initial request to establish a connection within the existing socket
 	ConnectionInit(ctx *SubscriptionContext, connectionParams map[string]interface{}) error
 	// Subscribe requests an graphql operation specified in the payload message
-	Subscribe(ctx *SubscriptionContext, id string, sub Subscription) error
+	Subscribe(ctx *SubscriptionContext, sub Subscription) error
 	// Unsubscribe sends a request to stop listening and complete the subscription
-	Unsubscribe(ctx *SubscriptionContext, id string) error
+	Unsubscribe(ctx *SubscriptionContext, sub Subscription) error
 	// OnMessage listens ongoing messages from server
-	OnMessage(ctx *SubscriptionContext, subscription Subscription, message OperationMessage)
+	OnMessage(ctx *SubscriptionContext, subscription Subscription, message OperationMessage) error
 	// Close terminates all subscriptions of the current websocket
 	Close(ctx *SubscriptionContext) error
 }
@@ -107,17 +131,20 @@ type SubscriptionProtocol interface {
 // SubscriptionContext represents a shared context for protocol implementations with the websocket connection inside
 type SubscriptionContext struct {
 	context.Context
-	websocketConn     WebsocketConn
-	OnConnected       func()
-	onDisconnected    func()
-	onConnectionAlive func()
-	cancel            context.CancelFunc
-	subscriptions     map[string]Subscription
-	disabledLogTypes  []OperationMessageType
-	log               func(args ...interface{})
-	acknowledged      int32
-	exitStatusCodes   []int
-	mutex             sync.Mutex
+	websocketConn WebsocketConn
+
+	OnConnected            func()
+	OnDisconnected         func()
+	OnConnectionAlive      func()
+	OnSubscriptionComplete func(sub Subscription)
+
+	cancel           context.CancelFunc
+	subscriptions    map[string]Subscription
+	disabledLogTypes []OperationMessageType
+	log              func(args ...interface{})
+	acknowledged     int32
+	retryStatusCodes [][]int32
+	mutex            sync.Mutex
 }
 
 // Log prints condition logging with message type filters
@@ -182,17 +209,35 @@ func (sc *SubscriptionContext) GetSubscription(id string) *Subscription {
 		return nil
 	}
 	sub, found := sc.subscriptions[id]
-	if !found {
-		return nil
+	if found {
+		return &sub
 	}
-	return &sub
+
+	for _, s := range sc.subscriptions {
+		if id == s.id {
+			return &s
+		}
+	}
+	return nil
 }
 
-// GetSubscriptionsLength returns the length of subscriptions
-func (sc *SubscriptionContext) GetSubscriptionsLength() int {
+// GetSubscriptionsLength returns the length of subscriptions by status
+func (sc *SubscriptionContext) GetSubscriptionsLength(status []SubscriptionStatus) int {
 	sc.mutex.Lock()
 	defer sc.mutex.Unlock()
-	return len(sc.subscriptions)
+	if len(status) == 0 {
+		return len(sc.subscriptions)
+	}
+	count := 0
+	for _, sub := range sc.subscriptions {
+		for _, s := range status {
+			if sub.status == s {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 // GetSubscription get all available subscriptions in the context
@@ -208,13 +253,13 @@ func (sc *SubscriptionContext) GetSubscriptions() map[string]Subscription {
 
 // SetSubscription set the input subscription state into the context
 // if subscription is nil, removes the subscription from the map
-func (sc *SubscriptionContext) SetSubscription(id string, sub *Subscription) {
+func (sc *SubscriptionContext) SetSubscription(key string, sub *Subscription) {
 	sc.mutex.Lock()
 	defer sc.mutex.Unlock()
 	if sub == nil {
-		delete(sc.subscriptions, id)
+		delete(sc.subscriptions, key)
 	} else {
-		sc.subscriptions[id] = *sub
+		sc.subscriptions[key] = *sub
 	}
 }
 
@@ -236,9 +281,13 @@ func (sc *SubscriptionContext) SetAcknowledge(value bool) {
 func (sc *SubscriptionContext) Close() error {
 	var err error
 	if conn := sc.GetWebsocketConn(); conn != nil {
-		err = conn.Close()
 		sc.SetWebsocketConn(nil)
+		if sc.OnDisconnected != nil {
+			sc.OnDisconnected()
+		}
+		err = conn.Close()
 	}
+
 	sc.Cancel()
 
 	return err
@@ -257,9 +306,23 @@ type handlerFunc func(data []byte, err error) error
 
 // Subscription stores the subscription declaration and its state
 type Subscription struct {
+	id      string
+	key     string
 	payload GraphQLRequestPayload
 	handler func(data []byte, err error)
-	started bool
+	status  SubscriptionStatus
+}
+
+// GetID returns the subscription ID
+func (s Subscription) GetID() string {
+	return s.id
+}
+
+// GetKey returns the unique key of the subscription map
+// Key is the immutable id of the subscription that is generated the first time
+// It is used for searching because the subscription id is refreshed whenever the client reset
+func (s Subscription) GetKey() string {
+	return s.key
 }
 
 // GetPayload returns the graphql request payload
@@ -267,48 +330,51 @@ func (s Subscription) GetPayload() GraphQLRequestPayload {
 	return s.payload
 }
 
-// GetStarted a public getter for the started status
-func (s Subscription) GetStarted() bool {
-	return s.started
-}
-
-// SetStarted a public getter for the started status
-func (s *Subscription) SetStarted(value bool) {
-	s.started = value
-}
-
 // GetHandler a public getter for the subscription handler
 func (s Subscription) GetHandler() func(data []byte, err error) {
 	return s.handler
 }
 
+// GetStatus a public getter for the subscription status
+func (s Subscription) GetStatus() SubscriptionStatus {
+	return s.status
+}
+
+// SetStatus a public getter for the subscription status
+func (s *Subscription) SetStatus(status SubscriptionStatus) {
+	s.status = status
+}
+
 // SubscriptionClient is a GraphQL subscription client.
 type SubscriptionClient struct {
-	url                string
-	context            *SubscriptionContext
-	connectionParams   map[string]interface{}
-	connectionParamsFn func() map[string]interface{}
-	protocol           SubscriptionProtocol
-	websocketOptions   WebsocketOptions
-	timeout            time.Duration
-	clientStatus       int32
-	readLimit          int64 // max size of response message. Default 10 MB
-	createConn         func(sc *SubscriptionClient) (WebsocketConn, error)
-	retryTimeout       time.Duration
-	onError            func(sc *SubscriptionClient, err error) error
-	errorChan          chan error
+	url                    string
+	context                *SubscriptionContext
+	connectionParams       map[string]interface{}
+	connectionParamsFn     func() map[string]interface{}
+	protocol               SubscriptionProtocol
+	websocketOptions       WebsocketOptions
+	timeout                time.Duration
+	clientStatus           int32
+	readLimit              int64 // max size of response message. Default 10 MB
+	createConn             func(sc *SubscriptionClient) (WebsocketConn, error)
+	retryTimeout           time.Duration
+	onError                func(sc *SubscriptionClient, err error) error
+	errorChan              chan error
+	exitWhenNoSubscription bool
+	mutex                  sync.Mutex
 }
 
 // NewSubscriptionClient constructs new subscription client
 func NewSubscriptionClient(url string) *SubscriptionClient {
 	return &SubscriptionClient{
-		url:          url,
-		timeout:      time.Minute,
-		readLimit:    10 * 1024 * 1024, // set default limit 10MB
-		createConn:   newWebsocketConn,
-		retryTimeout: time.Minute,
-		errorChan:    make(chan error),
-		protocol:     &subscriptionsTransportWS{},
+		url:                    url,
+		timeout:                time.Minute,
+		readLimit:              10 * 1024 * 1024, // set default limit 10MB
+		createConn:             newWebsocketConn,
+		retryTimeout:           time.Minute,
+		errorChan:              make(chan error),
+		protocol:               &subscriptionsTransportWS{},
+		exitWhenNoSubscription: true,
 		context: &SubscriptionContext{
 			subscriptions: make(map[string]Subscription),
 		},
@@ -327,7 +393,7 @@ func (sc *SubscriptionClient) GetTimeout() time.Duration {
 
 // GetContext returns current context of subscription client
 func (sc *SubscriptionClient) GetContext() context.Context {
-	return sc.context.GetContext()
+	return sc.getContext().GetContext()
 }
 
 // WithWebSocket replaces customized websocket client constructor
@@ -372,7 +438,7 @@ func (sc *SubscriptionClient) WithConnectionParamsFn(fn func() map[string]interf
 	return sc
 }
 
-// WithTimeout updates write timeout of websocket client
+// WithTimeout updates read and write timeout of websocket client
 func (sc *SubscriptionClient) WithTimeout(timeout time.Duration) *SubscriptionClient {
 	sc.timeout = timeout
 	return sc
@@ -382,6 +448,12 @@ func (sc *SubscriptionClient) WithTimeout(timeout time.Duration) *SubscriptionCl
 // The zero value means unlimited timeout
 func (sc *SubscriptionClient) WithRetryTimeout(timeout time.Duration) *SubscriptionClient {
 	sc.retryTimeout = timeout
+	return sc
+}
+
+// WithExitWhenNoSubscription the client should exit when all subscriptions were closed
+func (sc *SubscriptionClient) WithExitWhenNoSubscription(value bool) *SubscriptionClient {
+	sc.exitWhenNoSubscription = value
 	return sc
 }
 
@@ -403,8 +475,20 @@ func (sc *SubscriptionClient) WithReadLimit(limit int64) *SubscriptionClient {
 	return sc
 }
 
+// WithRetryStatusCodes allow retry the subscription connection when receiving one of these codes
+// the input parameter can be number string or range, e.g 4000-5000
+func (sc *SubscriptionClient) WithRetryStatusCodes(codes ...string) *SubscriptionClient {
+
+	statusCodes, err := parseInt32Ranges(codes)
+	if err != nil {
+		panic(err)
+	}
+	sc.context.retryStatusCodes = statusCodes
+	return sc
+}
+
 // OnError event is triggered when there is any connection error. This is bottom exception handler level
-// If this function is empty, or returns nil, the error is ignored
+// If this function is empty, or returns nil, the client restarts the connection
 // If returns error, the websocket connection will be terminated
 func (sc *SubscriptionClient) OnError(onError func(sc *SubscriptionClient, err error) error) *SubscriptionClient {
 	sc.onError = onError
@@ -419,14 +503,32 @@ func (sc *SubscriptionClient) OnConnected(fn func()) *SubscriptionClient {
 
 // OnDisconnected event is triggered when the websocket client was disconnected
 func (sc *SubscriptionClient) OnDisconnected(fn func()) *SubscriptionClient {
-	sc.context.onDisconnected = fn
+	sc.context.OnDisconnected = fn
 	return sc
 }
 
 // OnConnectionAlive event is triggered when the websocket receive a connection alive message (differs per protocol)
 func (sc *SubscriptionClient) OnConnectionAlive(fn func()) *SubscriptionClient {
-	sc.context.onConnectionAlive = fn
+	sc.context.OnConnectionAlive = fn
 	return sc
+}
+
+// OnSubscriptionComplete event is triggered when the subscription receives a terminated message from the server
+func (sc *SubscriptionClient) OnSubscriptionComplete(fn func(sub Subscription)) *SubscriptionClient {
+	sc.context.OnSubscriptionComplete = fn
+	return sc
+}
+
+func (sc *SubscriptionClient) getContext() *SubscriptionContext {
+	sc.mutex.Lock()
+	defer sc.mutex.Unlock()
+	return sc.context
+}
+
+func (sc *SubscriptionClient) setContext(value *SubscriptionContext) {
+	sc.mutex.Lock()
+	defer sc.mutex.Unlock()
+	sc.context = value
 }
 
 // get internal client status
@@ -443,26 +545,27 @@ func (sc *SubscriptionClient) setClientStatus(value int32) {
 func (sc *SubscriptionClient) init() error {
 
 	now := time.Now()
+	ctx := sc.getContext()
 	for {
 		var err error
 		var conn WebsocketConn
 		// allow custom websocket client
-		if sc.context.GetWebsocketConn() == nil {
-			sc.context.NewContext()
+		if ctx.GetWebsocketConn() == nil {
+			ctx.NewContext()
 			conn, err = sc.createConn(sc)
 			if err == nil {
-				sc.context.SetWebsocketConn(conn)
+				ctx.SetWebsocketConn(conn)
 			}
 		}
 
 		if err == nil {
-			sc.context.GetWebsocketConn().SetReadLimit(sc.readLimit)
+			ctx.GetWebsocketConn().SetReadLimit(sc.readLimit)
 			// send connection init event to the server
 			connectionParams := sc.connectionParams
 			if sc.connectionParamsFn != nil {
 				connectionParams = sc.connectionParamsFn()
 			}
-			err = sc.protocol.ConnectionInit(sc.context, connectionParams)
+			err = sc.protocol.ConnectionInit(ctx, connectionParams)
 		}
 
 		if err == nil {
@@ -470,12 +573,12 @@ func (sc *SubscriptionClient) init() error {
 		}
 
 		if sc.retryTimeout > 0 && now.Add(sc.retryTimeout).Before(time.Now()) {
-			if sc.context.onDisconnected != nil {
-				sc.context.onDisconnected()
+			if ctx.OnDisconnected != nil {
+				ctx.OnDisconnected()
 			}
 			return err
 		}
-		sc.context.Log(fmt.Sprintf("%s. retry in second...", err.Error()), "client", GQLInternal)
+		ctx.Log(fmt.Sprintf("%s. retry in second...", err.Error()), "client", GQLInternal)
 		time.Sleep(time.Second)
 	}
 }
@@ -497,43 +600,47 @@ func (sc *SubscriptionClient) NamedSubscribe(name string, v interface{}, variabl
 // SubscribeRaw sends start message to server and open a channel to receive data, with raw query
 // Deprecated: use Exec instead
 func (sc *SubscriptionClient) SubscribeRaw(query string, variables map[string]interface{}, handler func(message []byte, err error) error) (string, error) {
-	return sc.doRaw(query, variables, handler)
+	return sc.doRaw(query, variables, "", handler)
 }
 
 // Exec sends start message to server and open a channel to receive data, with raw query
 func (sc *SubscriptionClient) Exec(query string, variables map[string]interface{}, handler func(message []byte, err error) error) (string, error) {
-	return sc.doRaw(query, variables, handler)
+	return sc.doRaw(query, variables, "", handler)
 }
 
 func (sc *SubscriptionClient) do(v interface{}, variables map[string]interface{}, handler func(message []byte, err error) error, options ...Option) (string, error) {
-	query, err := ConstructSubscription(v, variables, options...)
+	query, operationName, err := ConstructSubscription(v, variables, options...)
 	if err != nil {
 		return "", err
 	}
 
-	return sc.doRaw(query, variables, handler)
+	return sc.doRaw(query, variables, operationName, handler)
 }
 
-func (sc *SubscriptionClient) doRaw(query string, variables map[string]interface{}, handler func(message []byte, err error) error) (string, error) {
+func (sc *SubscriptionClient) doRaw(query string, variables map[string]interface{}, operationName string, handler func(message []byte, err error) error) (string, error) {
 	id := uuid.New().String()
 
 	sub := Subscription{
+		id:  id,
+		key: id,
 		payload: GraphQLRequestPayload{
-			Query:     query,
-			Variables: variables,
+			Query:         query,
+			Variables:     variables,
+			OperationName: operationName,
 		},
 		handler: sc.wrapHandler(handler),
 	}
 
 	// if the websocket client is running and acknowledged by the server
 	// start subscription immediately
-	if sc.context != nil && sc.context.GetAcknowledge() {
-		if err := sc.protocol.Subscribe(sc.context, id, sub); err != nil {
+	ctx := sc.getContext()
+	if ctx != nil && sc.getClientStatus() == scStatusRunning && ctx.GetAcknowledge() {
+		if err := sc.protocol.Subscribe(ctx, sub); err != nil {
 			return "", err
 		}
+	} else {
+		ctx.SetSubscription(id, &sub)
 	}
-
-	sc.context.SetSubscription(id, &sub)
 
 	return id, nil
 }
@@ -549,7 +656,29 @@ func (sc *SubscriptionClient) wrapHandler(fn handlerFunc) func(data []byte, err 
 // Unsubscribe sends stop message to server and close subscription channel
 // The input parameter is subscription ID that is returned from Subscribe function
 func (sc *SubscriptionClient) Unsubscribe(id string) error {
-	return sc.protocol.Unsubscribe(sc.context, id)
+	ctx := sc.getContext()
+	if ctx == nil || ctx.GetWebsocketConn() == nil {
+		return nil
+	}
+	sub := ctx.GetSubscription(id)
+
+	if sub == nil {
+		return fmt.Errorf("subscription id %s doesn't not exist", id)
+	}
+
+	if sub.status == SubscriptionUnsubcribed {
+		return nil
+	}
+	var err error
+	if sub.status == SubscriptionRunning {
+		err = sc.protocol.Unsubscribe(ctx, *sub)
+	}
+	sub.status = SubscriptionUnsubcribed
+	ctx.SetSubscription(sub.key, sub)
+
+	sc.checkSubscriptionStatuses(ctx)
+
+	return err
 }
 
 // Run start the WebSocket client and subscriptions.
@@ -557,23 +686,29 @@ func (sc *SubscriptionClient) Unsubscribe(id string) error {
 // If this function is run with goroutine, it can be stopped after closed
 func (sc *SubscriptionClient) Run() error {
 
-	sc.reset()
+	if sc.getClientStatus() != scStatusInitializing {
+		sc.reset()
+	}
+
 	if err := sc.init(); err != nil {
 		return fmt.Errorf("retry timeout. exiting...")
 	}
 
-	sc.setClientStatus(scStatusRunning)
-	if sc.context == nil {
+	subContext := sc.getContext()
+	if subContext == nil {
 		return fmt.Errorf("the subscription context is nil")
 	}
-	conn := sc.context.GetWebsocketConn()
+
+	conn := subContext.GetWebsocketConn()
 	if conn == nil {
 		return fmt.Errorf("the websocket connection hasn't been created")
 	}
-	ctx := sc.context.GetContext()
+
+	sc.setClientStatus(scStatusRunning)
+	ctx := subContext.GetContext()
 
 	go func() {
-		for sc.getClientStatus() == scStatusRunning {
+		for {
 			select {
 			case <-ctx.Done():
 				return
@@ -581,128 +716,168 @@ func (sc *SubscriptionClient) Run() error {
 				var message OperationMessage
 				if err := conn.ReadJSON(&message); err != nil {
 					// manual EOF check
-					if err == io.EOF || strings.Contains(err.Error(), "EOF") {
-						sc.setClientStatus(scStatusInitializing)
-						sc.context.Cancel()
+					if err == io.EOF || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "connection reset by peer") {
+						sc.errorChan <- errRetry
 						return
 					}
-					closeStatus := websocket.CloseStatus(err)
-					switch closeStatus {
-					case websocket.StatusNormalClosure, websocket.StatusAbnormalClosure:
-						// close event from websocket client, exiting...
-						return
-					case StatusConnectionInitialisationTimeout, StatusTooManyInitialisationRequests, StatusSubscriberAlreadyExists, StatusUnauthorized:
-						sc.context.Log(err, "server", GQLError)
+					if errors.Is(err, context.Canceled) {
 						return
 					}
 
-					if closeStatus != -1 && closeStatus < 3000 && closeStatus > 4999 {
-						sc.context.Log(fmt.Sprintf("%s. Retry connecting...", err), "client", GQLInternal)
-						if err = sc.Run(); err != nil {
-							sc.errorChan <- err
+					closeStatus := conn.GetCloseStatus(err)
+
+					for _, retryCode := range subContext.retryStatusCodes {
+						if (len(retryCode) == 1 && retryCode[0] == closeStatus) ||
+							(len(retryCode) >= 2 && retryCode[0] <= closeStatus && closeStatus <= retryCode[1]) {
+							sc.errorChan <- errRetry
 							return
 						}
 					}
 
-					if isClosedSubscriptionError(err) {
-						_ = sc.Close()
+					switch websocket.StatusCode(closeStatus) {
+					case websocket.StatusBadGateway, websocket.StatusNoStatusRcvd:
+						sc.errorChan <- errRetry
+						return
+					case websocket.StatusNormalClosure, websocket.StatusAbnormalClosure:
+						// close event from websocket client, exiting...
+						subContext.Cancel()
+						return
+					case StatusInvalidMessage, StatusConnectionInitialisationTimeout, StatusTooManyInitialisationRequests, StatusSubscriberAlreadyExists, StatusUnauthorized:
+						subContext.Log(err, "server", GQL_CONNECTION_ERROR)
+						sc.errorChan <- err
 						return
 					}
 
 					if sc.onError != nil {
 						if err = sc.onError(sc, err); err != nil {
 							// end the subscription if the callback return error
-							_ = sc.Close()
+							subContext.Cancel()
 							return
 						}
 					}
 					continue
 				}
 
-				sub := sc.context.GetSubscription(message.ID)
+				sub := subContext.GetSubscription(message.ID)
 				if sub == nil {
 					sub = &Subscription{}
 				}
-				go sc.protocol.OnMessage(sc.context, *sub, message)
+				go func() {
+					if err := sc.protocol.OnMessage(subContext, *sub, message); err != nil {
+						sc.errorChan <- err
+					}
+
+					sc.checkSubscriptionStatuses(subContext)
+				}()
 			}
 		}
 	}()
 
-	for sc.getClientStatus() == scStatusRunning {
+	for {
 		select {
 		case <-ctx.Done():
-			if sc.context.GetSubscriptionsLength() == 0 {
-				sc.setClientStatus(scStatusClosing)
-			}
-			break
+			return sc.close(subContext)
 		case e := <-sc.errorChan:
+			if sc.getClientStatus() == scStatusClosing {
+				return nil
+			}
+
 			// stop the subscription if the error has stop message
 			if e == ErrSubscriptionStopped {
-				return sc.Close()
+				return sc.close(subContext)
+			}
+			if e == errRetry {
+				return sc.Run()
 			}
 
 			if sc.onError != nil {
 				if err := sc.onError(sc, e); err != nil {
-					_ = sc.Close()
+					sc.close(subContext)
 					return err
+				} else {
+					return sc.Run()
 				}
 			}
 		}
 	}
-	// if the client is closing, stop retrying
-	if sc.getClientStatus() == scStatusClosing {
-		return nil
-	}
-
-	return sc.Run()
 }
 
 // close the running websocket connection and reset all subscription states
 func (sc *SubscriptionClient) reset() {
-	sc.context.SetAcknowledge(false)
-	isRunning := sc.getClientStatus() == scStatusRunning
-
-	for id, sub := range sc.context.GetSubscriptions() {
-		if sub.GetStarted() {
-			sub.SetStarted(false)
-			if isRunning {
-				_ = sc.protocol.Unsubscribe(sc.context, id)
-			}
-			sc.context.SetSubscription(id, &sub)
-		}
+	subContext := sc.getContext()
+	// fork a new subscription context to start a new session
+	// avoid conflicting with the last running session what is shutting down
+	newContext := &SubscriptionContext{
+		OnConnected:            subContext.OnConnected,
+		OnDisconnected:         subContext.OnDisconnected,
+		OnSubscriptionComplete: subContext.OnSubscriptionComplete,
+		disabledLogTypes:       subContext.disabledLogTypes,
+		log:                    subContext.log,
+		retryStatusCodes:       subContext.retryStatusCodes,
+		subscriptions:          make(map[string]Subscription),
 	}
-	sc.setClientStatus(scStatusClosing)
 
-	_ = sc.protocol.Close(sc.context)
-	_ = sc.context.Close()
+	for key, sub := range subContext.GetSubscriptions() {
+		// remove subscriptions that are manually unsubscribed by the user
+		if sub.status == SubscriptionUnsubcribed {
+			continue
+		}
+		if sub.status == SubscriptionRunning {
+			sc.protocol.Unsubscribe(subContext, sub)
+		}
+
+		// should restart subscriptions with new id
+		// to avoid subscription id conflict errors from the server
+		sub.id = uuid.NewString()
+		sub.status = SubscriptionWaiting
+		newContext.SetSubscription(key, &sub)
+	}
+
+	sc.protocol.Close(subContext)
+	subContext.Close()
+
+	sc.setClientStatus(scStatusInitializing)
+	sc.setContext(newContext)
 }
 
 // Close closes all subscription channel and websocket as well
 func (sc *SubscriptionClient) Close() (err error) {
+	return sc.close(sc.getContext())
+}
+
+func (sc *SubscriptionClient) close(ctx *SubscriptionContext) (err error) {
 	if sc.getClientStatus() == scStatusClosing {
 		return nil
 	}
 
 	sc.setClientStatus(scStatusClosing)
-	if sc.context == nil {
+	if ctx == nil {
 		return
 	}
-
 	unsubscribeErrors := make(map[string]error)
 
-	for id := range sc.context.GetSubscriptions() {
-		if err := sc.protocol.Unsubscribe(sc.context, id); err != nil && !isClosedSubscriptionError(err) {
-			unsubscribeErrors[id] = err
+	conn := ctx.GetWebsocketConn()
+
+	for key, sub := range ctx.GetSubscriptions() {
+		ctx.SetSubscription(key, nil)
+		if conn == nil {
+			continue
+		}
+		if sub.status == SubscriptionRunning {
+			if err := sc.protocol.Unsubscribe(ctx, sub); err != nil {
+				unsubscribeErrors[key] = err
+			}
 		}
 	}
-	protocolCloseError := sc.protocol.Close(sc.context)
-	closeError := sc.context.Close()
 
-	if sc.context.onDisconnected != nil {
-		sc.context.onDisconnected()
+	var protocolCloseError error
+	if conn != nil {
+		protocolCloseError = sc.protocol.Close(ctx)
 	}
 
-	if len(unsubscribeErrors) > 0 || protocolCloseError != nil || closeError != nil {
+	closeError := ctx.Close()
+
+	if len(unsubscribeErrors) > 0 {
 		return Error{
 			Message: "failed to close the subscription client",
 			Extensions: map[string]interface{}{
@@ -713,6 +888,17 @@ func (sc *SubscriptionClient) Close() (err error) {
 		}
 	}
 	return nil
+}
+
+func (sc *SubscriptionClient) checkSubscriptionStatuses(ctx *SubscriptionContext) {
+	// close the client if there is no running subscription
+	if sc.exitWhenNoSubscription && ctx.GetSubscriptionsLength([]SubscriptionStatus{
+		SubscriptionRunning,
+		SubscriptionWaiting,
+	}) == 0 {
+		ctx.Log("no running subscription. exiting...", "client", GQLInternal)
+		ctx.Cancel()
+	}
 }
 
 // the reusable function for sending connection init message.
@@ -736,20 +922,24 @@ func connectionInit(conn *SubscriptionContext, connectionParams map[string]inter
 	return conn.Send(msg, GQLConnectionInit)
 }
 
-// accept closed websocket errors due to data races
-func isClosedSubscriptionError(err error) bool {
-
-	expectedErrorMessages := []string{
-		"context canceled",
-		"received header with unexpected rsv bits",
-	}
-	errMsg := err.Error()
-	for _, msg := range expectedErrorMessages {
-		if strings.Contains(errMsg, msg) {
-			return true
+func parseInt32Ranges(codes []string) ([][]int32, error) {
+	statusCodes := make([][]int32, 0, len(codes))
+	for _, c := range codes {
+		sRange := strings.Split(c, "-")
+		iRange := make([]int32, len(sRange))
+		for j, sCode := range sRange {
+			i, err := strconv.ParseInt(sCode, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("invalid status code; input: %s", sCode)
+			}
+			iRange[j] = int32(i)
+		}
+		if len(iRange) > 0 {
+			statusCodes = append(statusCodes, iRange)
 		}
 	}
-	return false
+
+	return statusCodes, nil
 }
 
 // default websocket handler implementation using https://github.com/nhooyr/websocket
@@ -777,6 +967,28 @@ func (wh *WebsocketHandler) ReadJSON(v interface{}) error {
 // Close implements the function to close the websocket connection
 func (wh *WebsocketHandler) Close() error {
 	return wh.Conn.Close(websocket.StatusNormalClosure, "close websocket")
+}
+
+// GetCloseStatus tries to get WebSocket close status from error
+// https://www.iana.org/assignments/websocket/websocket.xhtml
+func (wh *WebsocketHandler) GetCloseStatus(err error) int32 {
+	// context timeout error returned from ReadJSON or WriteJSON
+	// try to ping the server, if failed return abnormal closeure error
+	if errors.Is(err, context.DeadlineExceeded) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if pingErr := wh.Ping(ctx); pingErr != nil {
+			return int32(websocket.StatusNoStatusRcvd)
+		}
+		return -1
+	}
+
+	code := websocket.CloseStatus(err)
+	if code == -1 && strings.Contains(err.Error(), "received header with unexpected rsv bits") {
+		return int32(websocket.StatusNormalClosure)
+	}
+
+	return int32(code)
 }
 
 // the default constructor function to create a websocket client
