@@ -76,6 +76,8 @@ const (
 var (
 	// ErrSubscriptionStopped a special error which forces the subscription stop
 	ErrSubscriptionStopped = errors.New("subscription stopped")
+	// ErrSubscriptionNotExists an error denoting that subscription does not exist
+	ErrSubscriptionNotExists = errors.New("subscription does not exist")
 
 	errRetry = errors.New("retry subscription client")
 )
@@ -663,7 +665,7 @@ func (sc *SubscriptionClient) Unsubscribe(id string) error {
 	sub := ctx.GetSubscription(id)
 
 	if sub == nil {
-		return fmt.Errorf("subscription id %s doesn't not exist", id)
+		return fmt.Errorf("%s, %w", id, ErrSubscriptionNotExists)
 	}
 
 	if sub.status == SubscriptionUnsubcribed {
